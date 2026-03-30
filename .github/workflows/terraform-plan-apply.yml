@@ -62,13 +62,6 @@ permissions:
   contents: read
   pull-requests: write
 
-env:
-  TF_VERSION: ${{ inputs.terraform_version }}
-  ARM_USE_OIDC: true
-  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
 jobs:
   # ════════════════════════════════════════════════════════════════════
   # PLAN
@@ -77,6 +70,12 @@ jobs:
     name: "📋 Plan — ${{ inputs.environment }}"
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      TF_VERSION: ${{ inputs.terraform_version }}
+      ARM_USE_OIDC: true
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     outputs:
       plan_exit_code: ${{ steps.plan.outputs.exitcode }}
@@ -337,6 +336,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     environment: ${{ inputs.environment }}
+    env:
+      TF_VERSION: ${{ inputs.terraform_version }}
+      ARM_USE_OIDC: true
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     steps:
       - name: Checkout
