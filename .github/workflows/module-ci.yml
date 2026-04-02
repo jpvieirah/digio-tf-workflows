@@ -5,7 +5,7 @@
 # Módulos NÃO têm backend nem state — init roda sem backend.
 #
 # Caller:
-#   uses: jpvieirah/digio-tf-workflows/.github/workflows/module-ci.yml@v1
+#   uses: cbssdigital/digio-tf-workflows/.github/workflows/module-ci.yml@v1
 # ══════════════════════════════════════════════════════════════════════
 name: "Module CI"
 
@@ -32,10 +32,6 @@ on:
         required: false
         type: boolean
         default: true
-
-permissions:
-  contents: read
-  pull-requests: write
 
 jobs:
   validate:
@@ -101,8 +97,9 @@ jobs:
             echo ""
             echo "| Check | Status |"
             echo "|-------|--------|"
-            echo "| Format | ${{ steps.check_tests.outcome != 'skipped' && '✅' || '✅' }} |"
+            echo "| Format | ✅ |"
+            echo "| Init | ✅ |"
             echo "| Validate | ✅ |"
-            echo "| Checkov | ${{ inputs.checkov_enabled && '✅ ran' || '⏭️ skipped' }} |"
-            echo "| Tests | ${{ steps.check_tests.outputs.has_tests == 'true' && '✅ ran' || '⏭️ no test files' }} |"
+            echo "| Checkov | ${{ inputs.checkov_enabled && '✅' || '⏭️ skipped' }} |"
+            echo "| Tests | ${{ inputs.test_enabled && '✅' || '⏭️ skipped' }} |"
           } >> "$GITHUB_STEP_SUMMARY"

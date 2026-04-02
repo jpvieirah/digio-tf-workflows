@@ -3,7 +3,7 @@
 # ══════════════════════════════════════════════════════════════════════
 # Genérico: não conhece a infra, apenas mantém governança.
 # Callers usam:
-#   uses: jpvieirah/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
+#   uses: cbssdigital/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
 #
 # Job 1: plan  → init, fmt, validate, checkov, trivy, plan, infracost, summary, artifacts
 # Job 2: apply → environment gate (approval), apply, summary

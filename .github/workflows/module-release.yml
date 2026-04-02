@@ -6,7 +6,7 @@
 # via prefixo do commit (fix: → patch, feat: → minor, breaking: → major).
 #
 # Caller:
-#   uses: jpvieirah/digio-tf-workflows/.github/workflows/module-release.yml@v1
+#   uses: cbssdigital/digio-tf-workflows/.github/workflows/module-release.yml@v1
 # ══════════════════════════════════════════════════════════════════════
 name: "Module Release"
 
@@ -22,9 +22,6 @@ on:
       version:
         description: "The new version tag created"
         value: ${{ jobs.release.outputs.new_tag }}
-
-permissions:
-  contents: write
 
 jobs:
   release:

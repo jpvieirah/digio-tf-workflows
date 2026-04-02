@@ -44,7 +44,7 @@ on:
 
 jobs:
   deploy:
-    uses: jpvieirah/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
+    uses: cbssdigital/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
     with:
       environment: prd
       terraform_dir: "."
@@ -86,10 +86,10 @@ Este repositório é versionado por tags semânticas. Callers devem pinar em tag
 
 ```yaml
 # Tag (recomendado)
-uses: jpvieirah/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
+uses: cbssdigital/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
 
 # SHA (mais seguro)
-uses: jpvieirah/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@abc1234
+uses: cbssdigital/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@abc1234
 ```
 
 ## Tooling baseline
