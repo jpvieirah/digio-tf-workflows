@@ -1,12 +1,21 @@
 # ══════════════════════════════════════════════════════════════════════
 # Reusable Workflow — Terraform Plan & Apply
 # ══════════════════════════════════════════════════════════════════════
-# Genérico: não conhece a infra, apenas mantém governança.
-# Callers usam:
-#   uses: cbssdigital/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@v1
+# Zero hardcode. Backend derivado automaticamente do repo name + env.
+# Se o container nao existir no Storage Account, cria automaticamente.
 #
-# Job 1: plan  → init, fmt, validate, checkov, trivy, plan, infracost, summary, artifacts
-# Job 2: apply → environment gate (approval), apply, summary
+# Convencao:
+#   Repo:      terraform-workload-loan
+#   Container: tfstate-sub-{env}-{workload}   (ex: tfstate-sub-prd-loan)
+#   Key:       {workload}.tfstate              (ex: loan.tfstate)
+#
+# Caller minimo:
+#   jobs:
+#     deploy:
+#       uses: cbssdigital/digio-tf-workflows/.github/workflows/terraform-plan-apply.yml@main
+#       with:
+#         environment: prd
+#       secrets: inherit
 # ══════════════════════════════════════════════════════════════════════
 name: "Terraform Plan & Apply"
 
@@ -14,11 +23,21 @@ on:
   workflow_call:
     inputs:
       environment:
-        description: "Target environment (e.g. prd, nprd, dev)"
+        description: "Target environment (prd, uat, dev, pprd)"
         required: true
         type: string
+      backend_container:
+        description: "Override container name. Default = tfstate-sub-{env}-{workload}"
+        required: false
+        type: string
+        default: ""
+      backend_key:
+        description: "Override state key. Default = {workload}.tfstate"
+        required: false
+        type: string
+        default: ""
       terraform_dir:
-        description: "Path to terraform root module (e.g. . or terraform/prd)"
+        description: "Path to terraform root module"
         required: false
         type: string
         default: "."
@@ -32,15 +51,11 @@ on:
         required: false
         type: boolean
         default: false
-      backend_container:
-        description: "Azure Storage container for TF state"
+      runner:
+        description: "GitHub runner label"
         required: false
         type: string
-        default: "tfstate"
-      backend_key:
-        description: "State file key (e.g. sub-prod/workloads/app1.tfstate)"
-        required: true
-        type: string
+        default: "ubuntu-latest"
       checkov_enabled:
         description: "Run Checkov policy scan"
         required: false
@@ -57,33 +72,71 @@ on:
         type: boolean
         default: true
 
+    # Secrets (via secrets: inherit):
+    #   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_SUBSCRIPTION_ID
+    #   TF_STATE_RG, TF_STATE_SA
+    #   INFRACOST_API_KEY (opcional)
+
 jobs:
   # ════════════════════════════════════════════════════════════════════
   # PLAN
   # ════════════════════════════════════════════════════════════════════
   plan:
-    name: "📋 Plan — ${{ inputs.environment }}"
-    runs-on: ubuntu-latest
+    name: "Plan — ${{ inputs.environment }}"
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     env:
-      TF_VERSION: ${{ inputs.terraform_version }}
-      ARM_USE_OIDC: true
+      ARM_USE_OIDC: "true"
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     outputs:
       plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+      workload_name: ${{ steps.resolve.outputs.workload }}
+      container: ${{ steps.resolve.outputs.container }}
+      state_key: ${{ steps.resolve.outputs.key }}
 
     steps:
-      # ── Setup ──────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ── Resolve backend from repo name ───────────────────────────
+      - name: Resolve backend config
+        id: resolve
+        run: |
+          REPO_NAME="${{ github.event.repository.name }}"
+          ENV="${{ inputs.environment }}"
+
+          # Extrair workload name: remove prefixos comuns
+          WORKLOAD="$REPO_NAME"
+          WORKLOAD="${WORKLOAD#terraform-workload-}"
+          WORKLOAD="${WORKLOAD#terraform-}"
+          WORKLOAD="${WORKLOAD#workload-}"
+
+          # Container: usar override ou derivar
+          if [ -n "${{ inputs.backend_container }}" ]; then
+            CONTAINER="${{ inputs.backend_container }}"
+          else
+            CONTAINER="tfstate-sub-${ENV}-${WORKLOAD}"
+          fi
+
+          # Key: usar override ou derivar
+          if [ -n "${{ inputs.backend_key }}" ]; then
+            KEY="${{ inputs.backend_key }}"
+          else
+            KEY="${WORKLOAD}.tfstate"
+          fi
+
+          echo "workload=$WORKLOAD" >> "$GITHUB_OUTPUT"
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "::notice::Backend resolved — container=$CONTAINER key=$KEY workload=$WORKLOAD"
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          terraform_version: ${{ inputs.terraform_version }}
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -92,15 +145,39 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ── Terraform Core ─────────────────────────────────────────────
+      # ── Ensure container exists ──────────────────────────────────
+      - name: Ensure state container exists
+        run: |
+          CONTAINER="${{ steps.resolve.outputs.container }}"
+          SA="${{ secrets.TF_STATE_SA }}"
+
+          # Verificar se container existe, criar se nao
+          EXISTS=$(az storage container exists \
+            --name "$CONTAINER" \
+            --account-name "$SA" \
+            --auth-mode login \
+            --query "exists" -o tsv 2>/dev/null || echo "false")
+
+          if [ "$EXISTS" = "true" ]; then
+            echo "::notice::Container '$CONTAINER' already exists."
+          else
+            echo "::warning::Container '$CONTAINER' not found. Creating..."
+            az storage container create \
+              --name "$CONTAINER" \
+              --account-name "$SA" \
+              --auth-mode login \
+              --public-access off
+            echo "::notice::Container '$CONTAINER' created successfully."
+          fi
+
       - name: Terraform Init
         working-directory: ${{ inputs.terraform_dir }}
         run: |
           terraform init \
             -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
             -backend-config="storage_account_name=${{ secrets.TF_STATE_SA }}" \
-            -backend-config="container_name=${{ inputs.backend_container }}" \
-            -backend-config="key=${{ inputs.backend_key }}" \
+            -backend-config="container_name=${{ steps.resolve.outputs.container }}" \
+            -backend-config="key=${{ steps.resolve.outputs.key }}" \
             -backend-config="use_oidc=true"
 
       - name: Terraform Format Check
@@ -112,10 +189,9 @@ jobs:
         working-directory: ${{ inputs.terraform_dir }}
         run: terraform validate
 
-      # ── Checkov — Policy-as-Code ───────────────────────────────────
-      - name: "🛡️ Checkov — IaC Policy Scan"
+      # ── Checkov ──────────────────────────────────────────────────
+      - name: Checkov Scan
         if: inputs.checkov_enabled
-        id: checkov
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: ${{ inputs.terraform_dir }}
@@ -125,8 +201,8 @@ jobs:
           soft_fail: true
           quiet: true
 
-      # ── Trivy — Security Scan ──────────────────────────────────────
-      - name: "🔒 Trivy — IaC Security Scan"
+      # ── Trivy ────────────────────────────────────────────────────
+      - name: Trivy Scan
         if: inputs.trivy_enabled
         uses: aquasecurity/trivy-action@0.35.0
         with:
@@ -147,13 +223,12 @@ jobs:
             CRITS=$(jq '[.Results[]?.Misconfigurations[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json 2>/dev/null || echo 0)
             echo "highs=$HIGHS" >> "$GITHUB_OUTPUT"
             echo "criticals=$CRITS" >> "$GITHUB_OUTPUT"
-            echo "Trivy: $CRITS critical, $HIGHS high"
           else
             echo "highs=0" >> "$GITHUB_OUTPUT"
             echo "criticals=0" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── Terraform Plan ─────────────────────────────────────────────
+      # ── Plan ─────────────────────────────────────────────────────
       - name: Terraform Plan
         id: plan
         working-directory: ${{ inputs.terraform_dir }}
@@ -162,152 +237,125 @@ jobs:
           echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
         continue-on-error: true
 
-      # ── Infracost — Cost Estimation ────────────────────────────────
-      - name: "💰 Setup Infracost"
+      # ── Infracost ────────────────────────────────────────────────
+      - name: Setup Infracost
         if: inputs.infracost_enabled
         uses: infracost/actions/setup@v3
         with:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
-      - name: "💰 Infracost Breakdown"
+      - name: Infracost Breakdown
         if: inputs.infracost_enabled
         working-directory: ${{ inputs.terraform_dir }}
-        run: |
-          infracost breakdown \
-            --path . \
-            --format json \
-            --out-file infracost.json 2>/dev/null || true
+        run: infracost breakdown --path . --format json --out-file infracost.json 2>/dev/null || true
 
-      - name: "💰 Parse Infracost"
+      - name: Parse Infracost
         if: inputs.infracost_enabled
         id: infracost
         run: |
-          INFRA_FILE="${{ inputs.terraform_dir }}/infracost.json"
-          if [ -f "$INFRA_FILE" ]; then
-            MONTHLY=$(jq -r '.totalMonthlyCost // "N/A"' "$INFRA_FILE" 2>/dev/null || echo "N/A")
-            echo "monthly_cost=$MONTHLY" >> "$GITHUB_OUTPUT"
+          FILE="${{ inputs.terraform_dir }}/infracost.json"
+          if [ -f "$FILE" ]; then
+            echo "monthly_cost=$(jq -r '.totalMonthlyCost // "N/A"' "$FILE" 2>/dev/null || echo N/A)" >> "$GITHUB_OUTPUT"
           else
             echo "monthly_cost=N/A" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── Job Summary ────────────────────────────────────────────────
-      - name: "📊 Publish Job Summary"
+      # ── Summary ──────────────────────────────────────────────────
+      - name: Job Summary
         if: always()
         env:
           ENV_NAME: ${{ inputs.environment }}
           TF_DIR: ${{ inputs.terraform_dir }}
+          WORKLOAD: ${{ steps.resolve.outputs.workload }}
+          CONTAINER: ${{ steps.resolve.outputs.container }}
+          STATE_KEY: ${{ steps.resolve.outputs.key }}
           TRIVY_HIGHS: ${{ steps.trivy.outputs.highs || '0' }}
           TRIVY_CRITS: ${{ steps.trivy.outputs.criticals || '0' }}
           PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
           MONTHLY_COST: ${{ steps.infracost.outputs.monthly_cost || 'N/A' }}
         run: |
           {
-            echo "# 🏗️ Terraform Plan — \`$ENV_NAME\`"
+            echo "# Terraform Plan — \`$WORKLOAD\` / \`$ENV_NAME\`"
             echo ""
             echo "| Item | Value |"
             echo "|------|-------|"
+            echo "| **Workload** | \`$WORKLOAD\` |"
             echo "| **Environment** | \`$ENV_NAME\` |"
-            echo "| **Directory** | \`$TF_DIR\` |"
-            echo "| **Plan Exit Code** | \`$PLAN_EXIT\` (0=no changes, 1=error, 2=changes pending) |"
+            echo "| **Container** | \`$CONTAINER\` |"
+            echo "| **State Key** | \`$STATE_KEY\` |"
+            echo "| **Plan Exit Code** | \`$PLAN_EXIT\` (0=no changes, 1=error, 2=changes) |"
             echo "| **Trivy Critical** | $TRIVY_CRITS |"
             echo "| **Trivy High** | $TRIVY_HIGHS |"
             echo "| **Estimated Cost** | \$${MONTHLY_COST}/month |"
-
             if [ "$PLAN_EXIT" = "1" ]; then
               echo ""
-              echo "> ⛔ **Plan failed (exit code 1). Apply will be blocked automatically.**"
+              echo "> **Plan failed. Apply blocked.**"
             fi
             echo ""
-
-            echo "## 📝 Terraform Plan Output"
-            echo ""
+            echo "## Plan Output"
             echo '```'
-            if [ -f "$TF_DIR/plan.txt" ]; then
-              tail -100 "$TF_DIR/plan.txt"
-            else
-              echo "No plan output found"
-            fi
+            if [ -f "$TF_DIR/plan.txt" ]; then tail -100 "$TF_DIR/plan.txt"; else echo "No output"; fi
             echo '```'
-            echo ""
-
-            # Trivy findings
             if [ -f trivy-results.json ]; then
               FINDINGS=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy-results.json 2>/dev/null || echo 0)
               if [ "$FINDINGS" -gt 0 ]; then
-                echo "## 🔒 Trivy Security Findings"
                 echo ""
+                echo "## Trivy Findings"
                 echo "| Severity | ID | Title |"
                 echo "|----------|----|-------|"
                 jq -r '.Results[]?.Misconfigurations[]? | "| \(.Severity) | \(.ID) | \(.Title) |"' trivy-results.json 2>/dev/null | head -20
-                echo ""
               fi
             fi
-
-            # Checkov summary
             if [ -f checkov-results.json ]; then
               PASSED=$(jq '[.results?.passed_checks[]?] | length' checkov-results.json 2>/dev/null || echo 0)
               FAILED=$(jq '[.results?.failed_checks[]?] | length' checkov-results.json 2>/dev/null || echo 0)
               if [ "$FAILED" -gt 0 ] || [ "$PASSED" -gt 0 ]; then
-                echo "## 🛡️ Checkov Policy Summary"
                 echo ""
+                echo "## Checkov Summary"
                 echo "| Passed | Failed |"
                 echo "|--------|--------|"
                 echo "| $PASSED | $FAILED |"
-                echo ""
               fi
             fi
-
-            echo "---"
-            echo "📎 Full plan and reports available in **Artifacts**."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ── PR Comment (plan + cost summary) ───────────────────────────
-      - name: "💬 PR Comment"
+      # ── PR Comment ───────────────────────────────────────────────
+      - name: PR Comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         env:
           PLAN_EXIT: ${{ steps.plan.outputs.exitcode }}
           MONTHLY_COST: ${{ steps.infracost.outputs.monthly_cost || 'N/A' }}
           ENV_NAME: ${{ inputs.environment }}
+          WORKLOAD: ${{ steps.resolve.outputs.workload }}
           TRIVY_CRITS: ${{ steps.trivy.outputs.criticals || '0' }}
           TRIVY_HIGHS: ${{ steps.trivy.outputs.highs || '0' }}
         with:
           script: |
             const fs = require('fs');
             const tfDir = '${{ inputs.terraform_dir }}';
-            let planOutput = 'No plan output found';
+            let planOutput = 'No plan output';
             try {
               const raw = fs.readFileSync(`${tfDir}/plan.txt`, 'utf8');
               planOutput = raw.length > 4000 ? '...\n' + raw.slice(-4000) : raw;
             } catch {}
-
             const body = [
-              `### 🏗️ Terraform Plan — \`${process.env.ENV_NAME}\``,
-              '',
-              `| Item | Value |`,
-              `|------|-------|`,
+              `### Terraform Plan — \`${process.env.WORKLOAD}\` / \`${process.env.ENV_NAME}\``,
+              '', '| Item | Value |', '|------|-------|',
               `| Plan Exit Code | \`${process.env.PLAN_EXIT}\` |`,
               `| Trivy Critical | ${process.env.TRIVY_CRITS} |`,
               `| Trivy High | ${process.env.TRIVY_HIGHS} |`,
               `| Estimated Cost | \$${process.env.MONTHLY_COST}/month |`,
-              '',
-              '<details><summary>Plan Output</summary>',
-              '',
-              '```',
-              planOutput,
-              '```',
-              '</details>',
+              '', '<details><summary>Plan Output</summary>', '',
+              '```', planOutput, '```', '</details>',
             ].join('\n');
-
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body,
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body,
             });
 
-      # ── Upload Artifacts ───────────────────────────────────────────
-      - name: Upload Plan Artifacts
+      # ── Artifacts ────────────────────────────────────────────────
+      - name: Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -325,15 +373,14 @@ jobs:
   # APPLY
   # ════════════════════════════════════════════════════════════════════
   apply:
-    name: "🚀 Apply — ${{ inputs.environment }}"
+    name: "Apply — ${{ inputs.environment }}"
     needs: plan
     if: inputs.apply == true && needs.plan.outputs.plan_exit_code != '1'
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
     environment: ${{ inputs.environment }}
     env:
-      TF_VERSION: ${{ inputs.terraform_version }}
-      ARM_USE_OIDC: true
+      ARM_USE_OIDC: "true"
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
@@ -345,7 +392,7 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          terraform_version: ${{ inputs.terraform_version }}
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -360,8 +407,8 @@ jobs:
           terraform init \
             -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
             -backend-config="storage_account_name=${{ secrets.TF_STATE_SA }}" \
-            -backend-config="container_name=${{ inputs.backend_container }}" \
-            -backend-config="key=${{ inputs.backend_key }}" \
+            -backend-config="container_name=${{ needs.plan.outputs.container }}" \
+            -backend-config="key=${{ needs.plan.outputs.state_key }}" \
             -backend-config="use_oidc=true"
 
       - name: Download Plan Artifact
@@ -382,16 +429,17 @@ jobs:
             terraform apply -auto-approve
           fi
 
-      - name: "✅ Post Apply Summary"
+      - name: Apply Summary
         run: |
           {
-            echo "## ✅ Terraform Apply — \`${{ inputs.environment }}\`"
-            echo ""
-            echo "Deploy realizado com sucesso no ambiente **${{ inputs.environment }}**."
+            echo "## Terraform Apply — \`${{ needs.plan.outputs.workload_name }}\` / \`${{ inputs.environment }}\`"
             echo ""
             echo "| Item | Value |"
             echo "|------|-------|"
+            echo "| **Workload** | \`${{ needs.plan.outputs.workload_name }}\` |"
+            echo "| **Container** | \`${{ needs.plan.outputs.container }}\` |"
+            echo "| **State Key** | \`${{ needs.plan.outputs.state_key }}\` |"
             echo "| **Commit** | \`${{ github.sha }}\` |"
-            echo "| **Triggered by** | ${{ github.actor }} |"
+            echo "| **Actor** | ${{ github.actor }} |"
             echo "| **Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
           } >> "$GITHUB_STEP_SUMMARY"
